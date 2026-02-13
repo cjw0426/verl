@@ -497,6 +497,22 @@ class RayPPOTrainer:
                 )
             return tensor
 
+        def _truncate_token_ids(token_ids: List[int], target_len: int, trunc_mode: str) -> List[int]:
+            if len(token_ids) <= target_len:
+                return token_ids
+            if target_len <= 0:
+                return []
+            assert trunc_mode in ["left", "right", "middle", "error"]
+            if trunc_mode == "left":
+                return token_ids[-target_len:]
+            if trunc_mode == "right":
+                return token_ids[:target_len]
+            if trunc_mode == "middle":
+                left_half = target_len // 2
+                right_half = target_len - left_half
+                return token_ids[:left_half] + token_ids[-right_half:]
+            raise NotImplementedError(f"{len(token_ids)=} is larger than {target_len=}")
+
         def _build_qwen2_vl_position_ids(
             input_ids_1d: torch.Tensor,
             attention_mask_1d: torch.Tensor,
@@ -572,7 +588,8 @@ class RayPPOTrainer:
             input_ids_list, attn_list, pos_list = [], [], []
             new_mm_inputs = []
 
-            for idx, (prompt, ans_ids, assistant_content) in enumerate(zip(prompts, answer_ids, assistant_contents)):
+            response_length = int(responses.size(1))
+            for idx, (prompt, assistant_content) in enumerate(zip(prompts, assistant_contents)):
                 if multi_modal_data is None or idx >= len(multi_modal_data):
                     has_mm = False
                     break
@@ -619,9 +636,10 @@ class RayPPOTrainer:
                     else:
                         position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0)
 
-                ans_tensor = torch.tensor(ans_ids, dtype=torch.long, device=input_ids.device)
-                input_ids = torch.cat([input_ids, ans_tensor], dim=0)
-                attention_mask = torch.cat([attention_mask, torch.ones_like(ans_tensor)], dim=0)
+                resp_row = responses[idx].to(device=input_ids.device, dtype=torch.long)
+                resp_mask = (resp_row != self.tokenizer.pad_token_id).long()
+                input_ids = torch.cat([input_ids, resp_row], dim=0)
+                attention_mask = torch.cat([attention_mask, resp_mask], dim=0)
 
                 if position_ids.shape[-1] > 0:
                     last_pos = position_ids[..., -1:]
@@ -631,7 +649,7 @@ class RayPPOTrainer:
                     else:
                         last_pos = torch.zeros((position_ids.size(0), 1), dtype=position_ids.dtype, device=position_ids.device)
 
-                tail_delta = torch.arange(1, len(ans_ids) + 1, device=position_ids.device, dtype=position_ids.dtype)
+                tail_delta = torch.arange(1, response_length + 1, device=position_ids.device, dtype=position_ids.dtype)
                 if position_ids.dim() == 1:
                     position_ids = torch.cat([position_ids, last_pos + tail_delta], dim=-1)
                 else:
@@ -684,10 +702,29 @@ class RayPPOTrainer:
         # text-only branch
         prompt_texts = [_chat_template_text(p, a) for p, a in zip(prompts, assistant_contents)]
         prompt_ids = [self.tokenizer.encode(p, add_special_tokens=False) for p in prompt_texts]
-        seq_tensors = [torch.tensor(p + a, dtype=torch.long) for p, a in zip(prompt_ids, answer_ids)]
+        response_length = int(responses.size(1))
+        if max_length is not None:
+            max_prompt_len = int(max_length) - response_length
+            if max_prompt_len <= 0:
+                return None, None
+            prompt_ids = [_truncate_token_ids(ids, max_prompt_len, truncation) for ids in prompt_ids]
 
-        input_ids = pad_sequence(seq_tensors, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        prompt_max_len = max((len(ids) for ids in prompt_ids), default=0)
+        batch_size = len(prompt_ids)
+        pad_token_id = self.tokenizer.pad_token_id
+
+        input_ids = torch.full((batch_size, prompt_max_len + response_length), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, prompt_max_len + response_length), dtype=torch.long)
+
+        for i, ids in enumerate(prompt_ids):
+            prompt_len_i = len(ids)
+            prompt_start = prompt_max_len - prompt_len_i
+            if prompt_len_i > 0:
+                input_ids[i, prompt_start:prompt_max_len] = torch.tensor(ids, dtype=torch.long)
+                attention_mask[i, prompt_start:prompt_max_len] = 1
+            input_ids[i, prompt_max_len:] = responses[i]
+            attention_mask[i, prompt_max_len:] = (responses[i] != pad_token_id).long()
+
         if _is_qwen2_vl_processor():
             pos_list = []
             for i in range(input_ids.size(0)):
@@ -701,29 +738,6 @@ class RayPPOTrainer:
             position_ids = torch.stack(pos_list, dim=0)  # (bs, 4, seq_len)
         else:
             position_ids = torch.clip(attention_mask.cumsum(dim=1) - 1, min=0)
-
-        if max_length is not None:
-            input_ids = _resize_last_dim(
-                input_ids,
-                target_len=max_length,
-                pad_value=self.tokenizer.pad_token_id,
-                left_pad=True,
-                trunc_mode=truncation,
-            )
-            attention_mask = _resize_last_dim(
-                attention_mask,
-                target_len=max_length,
-                pad_value=0,
-                left_pad=True,
-                trunc_mode=truncation,
-            )
-            position_ids = _resize_last_dim(
-                position_ids,
-                target_len=max_length,
-                pad_value=0,
-                left_pad=True,
-                trunc_mode=truncation,
-            )
 
         data = DataProto.from_dict(
             tensors={
@@ -1071,10 +1085,13 @@ class RayPPOTrainer:
             or 8192
         )
         probs_np: List[np.ndarray] = []
+        mean_lp_np: List[np.ndarray] = []
         debug_budget_map = {k: debug_budget for k in ("p1", "p2", "p3")}
         debug_records: List[Dict[str, Any]] = []
+        mm_total_count = 0
+        mm_used_count = 0
 
-        def _compute_probs_for_key(key: str) -> np.ndarray:
+        def _compute_probs_for_key(key: str) -> tuple[np.ndarray, np.ndarray]:
             mean_lp_chunks: List[torch.Tensor] = []
             total = len(prompts_all[key]["user"])
             for start in range(0, total, score_batch_size):
@@ -1112,6 +1129,11 @@ class RayPPOTrainer:
                     if chunk_size > 0:
                         mean_lp_chunks.append(torch.full((chunk_size,), float("nan"), dtype=torch.float32))
                     continue
+                chunk_size = len(prompts_all[key]["user"][start:end])
+                if chunk_size > 0:
+                    mm_total_count += chunk_size
+                    if "multi_modal_inputs" in prob_batch.non_tensor_batch:
+                        mm_used_count += chunk_size
                 logprob_proto = self._safe_compute_log_probs(prob_batch)
                 log_probs = logprob_proto.batch["old_log_probs"]
                 valid_mask = (prob_responses != self.tokenizer.pad_token_id).float()
@@ -1158,32 +1180,46 @@ class RayPPOTrainer:
                         debug_budget_map[key] = max(0, debug_budget_map.get(key, 0) - 1)
 
             if not mean_lp_chunks:
-                return np.array([], dtype=np.float32)
+                empty = np.array([], dtype=np.float32)
+                return empty, empty
             mean_lp_all = torch.cat(mean_lp_chunks, dim=0)
             probs = torch.exp(mean_lp_all)
-            return probs.cpu().numpy().astype(np.float32)
+            return probs.cpu().numpy().astype(np.float32), mean_lp_all.cpu().numpy().astype(np.float32)
 
         for key in ("p1", "p2", "p3"):
-            probs_np.append(_compute_probs_for_key(key))
+            probs, mean_lp = _compute_probs_for_key(key)
+            probs_np.append(probs)
+            mean_lp_np.append(mean_lp)
 
-        if len(probs_np) != 3:
+        if len(probs_np) != 3 or len(mean_lp_np) != 3:
             return {}, None
         p1, p2, p3 = probs_np
+        lp1, lp2, lp3 = mean_lp_np
         if not (len(p1) == len(p2) == len(p3) == len(questions)):
             min_len = min(len(p1), len(p2), len(p3), len(questions))
             if min_len == 0:
                 return {}, None
             p1, p2, p3 = p1[:min_len], p2[:min_len], p3[:min_len]
-        prog_desc = (p2 > p1).astype(np.float32)
-        prog_reason = (p3 > p2).astype(np.float32)
-        progression_rewards = 0.5 * prog_desc + 0.5 * prog_reason
+            lp1, lp2, lp3 = lp1[:min_len], lp2[:min_len], lp3[:min_len]
+        valid_mask = np.isfinite(p1) & np.isfinite(p2) & np.isfinite(p3)
+        if not np.any(valid_mask):
+            return {}, None
+        prog_desc = (p2[valid_mask] > p1[valid_mask]).astype(np.float32)
+        prog_reason = (p3[valid_mask] > p2[valid_mask]).astype(np.float32)
+        progression_rewards = np.zeros_like(p1, dtype=np.float32)
+        progression_rewards[valid_mask] = 0.5 * prog_desc + 0.5 * prog_reason
         metrics = {
             "p/prob_p1": float(np.nanmean(p1)) if len(p1) else float("nan"),
             "p/prob_p2": float(np.nanmean(p2)) if len(p2) else float("nan"),
             "p/prob_p3": float(np.nanmean(p3)) if len(p3) else float("nan"),
+            "p/logprob_p1": float(np.nanmean(lp1)) if len(lp1) else float("nan"),
+            "p/logprob_p2": float(np.nanmean(lp2)) if len(lp2) else float("nan"),
+            "p/logprob_p3": float(np.nanmean(lp3)) if len(lp3) else float("nan"),
             "p/prog_description": float(np.mean(prog_desc)) if len(prog_desc) else float("nan"),
             "p/prog_reasoning": float(np.mean(prog_reason)) if len(prog_reason) else float("nan"),
             "p/prog_delta": float(np.nanmean((p2 - p1) + (p3 - p2))) if len(p1) else float("nan"),
+            "p/score_valid_ratio": float(valid_mask.mean()),
+            "p/mm_used_ratio": float(mm_used_count / mm_total_count) if mm_total_count > 0 else float("nan"),
         }
         if debug_records:
             for rec in debug_records:
