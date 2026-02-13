@@ -13,7 +13,7 @@
 # limitations under the License.
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Generator, TypedDict
+from typing import TYPE_CHECKING, Any, Generator, TypedDict
 
 import ray
 import torch
@@ -24,7 +24,10 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
+from verl.workers.rollout import BaseRollout, get_rollout_class
+
+if TYPE_CHECKING:
+    from verl.workers.rollout.replica import RolloutReplica
 
 
 class TensorMeta(TypedDict):
@@ -316,7 +319,7 @@ class CheckpointEngineManager:
         self,
         backend: str,
         trainer: RayWorkerGroup,
-        replicas: list[RolloutReplica],
+        replicas: list["RolloutReplica"],
     ) -> None:
         self.backend = backend
         self.backend_cls = CheckpointEngineRegistry.get(backend)
@@ -350,7 +353,7 @@ class CheckpointEngineManager:
             trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(**rollout_kwargs)
         )
 
-    def add_replicas(self, replicas: list[RolloutReplica]):
+    def add_replicas(self, replicas: list["RolloutReplica"]):
         """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
 
         Args:
@@ -358,7 +361,7 @@ class CheckpointEngineManager:
         """
         self.replicas.extend(replicas)
 
-    def remove_replicas(self, replicas: list[RolloutReplica]):
+    def remove_replicas(self, replicas: list["RolloutReplica"]):
         """Remove rollout replicas from the manager for elastic scale down, will rebuild process group.
 
         Args:

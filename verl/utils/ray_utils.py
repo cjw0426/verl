@@ -17,6 +17,8 @@ Contains commonly used utilities for ray
 
 import asyncio
 import concurrent.futures
+import functools
+import inspect
 import os
 from typing import Any, Optional
 
@@ -90,3 +92,24 @@ def get_event_loop():
         asyncio.set_event_loop(loop)
 
     return loop
+
+
+def auto_await(func):
+    """Run coroutine in sync context, or return coroutine in async context."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        coro = func(*args, **kwargs)
+        if not inspect.iscoroutine(coro):
+            return coro
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return coro
+        return asyncio.run(coro)
+
+    return wrapper
